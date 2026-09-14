@@ -51,7 +51,7 @@ vi.mock('../update.js', () => ({
 }));
 
 import { acquireLock, releaseLock } from '../update.js';
-import { commitAndPushReports, ensureReportsWorktree, refreshReportsWorktree } from '../utils/reports-branch.js';
+import { ensureReportsWorktree, refreshReportsWorktree, updateReports } from '../utils/reports-branch.js';
 
 const config: LocalConfig = {
   repo: {
@@ -131,27 +131,51 @@ describe('ensureReportsWorktree read-only cold start', () => {
   });
 });
 
-describe('commitAndPushReports', () => {
+describe('updateReports', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.isGitRepo.mockResolvedValue(true);
+    mocks.worktreeGit.revparse.mockResolvedValue('true');
+    // Offline: the sync keeps the local copy and the write proceeds.
+    mocks.worktreeGit.fetch.mockRejectedValue(new Error('offline'));
     mocks.worktreeGit.add.mockResolvedValue(undefined);
     mocks.worktreeGit.commit.mockResolvedValue(undefined);
     mocks.worktreeGit.push.mockResolvedValue(undefined);
-    mocks.worktreeGit.revparse.mockResolvedValue('true');
-    mocks.worktreeGit.status.mockResolvedValue({ staged: ['members/alice.yaml'] });
+    mocks.worktreeGit.status.mockResolvedValue({ staged: ['members/alice.yaml'], isClean: () => true });
     vi.mocked(acquireLock).mockResolvedValue(true);
     vi.mocked(releaseLock).mockResolvedValue(undefined);
   });
 
   it('skips git hooks on the isolated reports worktree commit', async () => {
-    const pushed = await commitAndPushReports(config, '[teamai] Register member: alice', ['members/']);
+    const pushed = await updateReports(config, async (wt) => {
+      expect(wt).toBe(WT);
+      return { files: ['members/'], message: '[teamai] Register member: alice' };
+    });
 
     expect(pushed).toBe(true);
     expect(mocks.worktreeGit.commit).toHaveBeenCalledWith(
       '[teamai] Register member: alice',
       { '--no-verify': null },
     );
+    expect(releaseLock).toHaveBeenCalledOnce();
+  });
+
+  it('does not run the write while another report write holds the lock', async () => {
+    vi.mocked(acquireLock).mockResolvedValue(false);
+    const write = vi.fn();
+
+    await expect(updateReports(config, write)).resolves.toBe(false);
+
+    expect(write).not.toHaveBeenCalled();
+    expect(mocks.worktreeGit.commit).not.toHaveBeenCalled();
+  });
+
+  it('returns false without committing when the write has nothing to publish', async () => {
+    await expect(updateReports(config, async () => null)).resolves.toBe(false);
+
+    expect(mocks.worktreeGit.add).not.toHaveBeenCalled();
+    expect(mocks.worktreeGit.commit).not.toHaveBeenCalled();
+    expect(releaseLock).toHaveBeenCalledOnce();
   });
 });
 

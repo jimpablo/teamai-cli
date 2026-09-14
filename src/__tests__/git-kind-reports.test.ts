@@ -9,12 +9,14 @@ import path from 'node:path';
 import { simpleGit } from 'simple-git';
 
 import { getReportsDir, REPORTS_WORKTREE_DIRNAME, type LocalConfig } from '../types.js';
-import { commitAndPushReports, ensureReportsWorktree, refreshReportsWorktree } from '../utils/reports-branch.js';
+import { ensureReportsWorktree, refreshReportsWorktree, updateReports } from '../utils/reports-branch.js';
 import { pushRepoDirectly } from '../utils/git.js';
 import { reportUsageToTeam } from '../team-push.js';
 
 let tmp: string;
 let originalHome: string;
+
+const READ_ONLY = { pushIfCreated: false } as const;
 
 beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-git-reports-'));
@@ -77,6 +79,33 @@ function gitConfig(clone: string, origin: string, username = 'alice'): LocalConf
   };
 }
 
+/** Another independent checkout of the same team repo (a second member or machine). */
+async function cloneCheckout(origin: string, name: string, username = 'alice'): Promise<LocalConfig> {
+  const clone = path.join(tmp, name, 'team-repo');
+  fs.mkdirSync(path.dirname(clone), { recursive: true });
+  await simpleGit().clone(origin, clone);
+  await configureGit(clone);
+  return gitConfig(clone, origin, username);
+}
+
+/** Write one report file through updateReports and publish it. */
+function publish(cfg: LocalConfig, relPath: string, content: string): Promise<boolean> {
+  return updateReports(cfg, async (wt) => {
+    fs.mkdirSync(path.dirname(path.join(wt, relPath)), { recursive: true });
+    fs.writeFileSync(path.join(wt, relPath), content);
+    return { files: [relPath], message: `[teamai] Update ${relPath}` };
+  });
+}
+
+async function originReportsFile(origin: string, relPath: string): Promise<string> {
+  return simpleGit(origin).show([`teamai-reports:${relPath}`]);
+}
+
+async function originHasReportsBranch(origin: string): Promise<boolean> {
+  const heads = await simpleGit(origin).raw(['for-each-ref', '--format=%(refname:short)', 'refs/heads']);
+  return heads.split('\n').includes('teamai-reports');
+}
+
 describe('git-kind reports branch', () => {
   it('places the reports dir as a sibling of the clone', () => {
     const clone = '/home/alice/.teamai/team-repo';
@@ -93,10 +122,7 @@ describe('git-kind reports branch', () => {
     expect(wt).toBe(path.join(tmp, REPORTS_WORKTREE_DIRNAME));
     expect(path.dirname(wt)).toBe(path.dirname(clone));
 
-    const memberDir = path.join(wt, 'members');
-    fs.mkdirSync(memberDir, { recursive: true });
-    fs.writeFileSync(path.join(memberDir, 'alice.yaml'), 'username: alice\n');
-    const pushed = await commitAndPushReports(cfg, '[teamai] Register member: alice', ['members/']);
+    const pushed = await publish(cfg, 'members/alice.yaml', 'username: alice\n');
     expect(pushed).toBe(true);
 
     const ts = new Date().toISOString();
@@ -131,9 +157,7 @@ describe('git-kind reports branch', () => {
 
     const cfg = gitConfig(clone, origin);
     const wt = await ensureReportsWorktree(cfg);
-    fs.mkdirSync(path.join(wt, 'members'), { recursive: true });
-    fs.writeFileSync(path.join(wt, 'members', 'alice.yaml'), 'username: alice\n');
-    await commitAndPushReports(cfg, '[teamai] Register member: alice', ['members/']);
+    await publish(cfg, 'members/alice.yaml', 'username: alice\n');
 
     expect(fs.readFileSync(leftover, 'utf-8')).toContain('username: stale');
     expect(fs.existsSync(path.join(wt, 'members', 'stale.yaml'))).toBe(false);
@@ -171,10 +195,8 @@ describe('git-kind reports branch', () => {
     ]);
 
     const cfg = gitConfig(clone, origin);
-    const wt = await ensureReportsWorktree(cfg);
-    fs.mkdirSync(path.join(wt, 'members'), { recursive: true });
-    fs.writeFileSync(path.join(wt, 'members', 'alice.yaml'), 'username: alice\n');
-    const pushed = await commitAndPushReports(cfg, '[teamai] Register member: alice', ['members/']);
+    await ensureReportsWorktree(cfg);
+    const pushed = await publish(cfg, 'members/alice.yaml', 'username: alice\n');
     expect(pushed).toBe(true);
 
     const originGit = simpleGit(origin);
@@ -213,9 +235,7 @@ describe('git-kind reports branch', () => {
     const cfg = gitConfig(clone, origin);
 
     const wt = await ensureReportsWorktree(cfg);
-    fs.mkdirSync(path.join(wt, 'members'), { recursive: true });
-    fs.writeFileSync(path.join(wt, 'members', 'alice.yaml'), 'username: alice\n');
-    expect(await commitAndPushReports(cfg, '[teamai] Register member: alice', ['members/'])).toBe(true);
+    expect(await publish(cfg, 'members/alice.yaml', 'username: alice\n')).toBe(true);
 
     fs.rmSync(clone, { recursive: true, force: true });
     await simpleGit().clone(origin, clone);
@@ -227,9 +247,7 @@ describe('git-kind reports branch', () => {
     const rebuilt = await ensureReportsWorktree(cfg);
     expect(rebuilt).toBe(wt);
 
-    fs.mkdirSync(path.join(wt, 'members'), { recursive: true });
-    fs.writeFileSync(path.join(wt, 'members', 'bob.yaml'), 'username: bob\n');
-    expect(await commitAndPushReports(cfg, '[teamai] Register member: bob', ['members/'])).toBe(true);
+    expect(await publish(cfg, 'members/bob.yaml', 'username: bob\n')).toBe(true);
 
     const originGit = simpleGit(origin);
     const reportsTree = await originGit.raw(['ls-tree', '-r', '--name-only', 'teamai-reports']);
@@ -237,34 +255,6 @@ describe('git-kind reports branch', () => {
     expect(reportsTree).toContain('members/bob.yaml');
   });
 });
-
-const READ_ONLY = { pushIfCreated: false } as const;
-
-/** Another independent checkout of the same team repo (a second member or machine). */
-async function cloneCheckout(origin: string, name: string, username = 'alice'): Promise<LocalConfig> {
-  const clone = path.join(tmp, name, 'team-repo');
-  fs.mkdirSync(path.dirname(clone), { recursive: true });
-  await simpleGit().clone(origin, clone);
-  await configureGit(clone);
-  return gitConfig(clone, origin, username);
-}
-
-/** Write one report file into the reports worktree and publish it. */
-async function publish(cfg: LocalConfig, relPath: string, content: string): Promise<boolean> {
-  const wt = await ensureReportsWorktree(cfg);
-  fs.mkdirSync(path.dirname(path.join(wt, relPath)), { recursive: true });
-  fs.writeFileSync(path.join(wt, relPath), content);
-  return commitAndPushReports(cfg, `[teamai] Update ${relPath}`, [relPath]);
-}
-
-async function originReportsFile(origin: string, relPath: string): Promise<string> {
-  return simpleGit(origin).show([`teamai-reports:${relPath}`]);
-}
-
-async function originHasReportsBranch(origin: string): Promise<boolean> {
-  const heads = await simpleGit(origin).raw(['for-each-ref', '--format=%(refname:short)', 'refs/heads']);
-  return heads.split('\n').includes('teamai-reports');
-}
 
 describe('git-kind reports: read-only cold start (#558)', () => {
   it('materializes a local reports view without publishing the branch', async () => {
@@ -338,7 +328,7 @@ describe('git-kind reports: refresh before reading (#557)', () => {
     const alice = gitConfig(clone, origin);
     const wt = await ensureReportsWorktree(alice);
 
-    // A writer has written its file but not committed it yet.
+    // Uncommitted report file left in the worktree (e.g. an interrupted write).
     fs.mkdirSync(path.join(wt, 'stats'), { recursive: true });
     fs.writeFileSync(path.join(wt, 'stats', 'alice.yaml'), 'n: 1\n');
 
@@ -349,7 +339,7 @@ describe('git-kind reports: refresh before reading (#557)', () => {
     expect(fs.existsSync(path.join(wt, 'votes', 'bob.yaml'))).toBe(true);
     expect(fs.readFileSync(path.join(wt, 'stats', 'alice.yaml'), 'utf-8')).toBe('n: 1\n');
 
-    expect(await commitAndPushReports(alice, '[teamai] Update usage stats for alice', ['stats/alice.yaml'])).toBe(true);
+    expect(await publish(alice, 'stats/alice.yaml', 'n: 1\n')).toBe(true);
     expect(await originReportsFile(origin, 'stats/alice.yaml')).toBe('n: 1\n');
   });
 
@@ -376,5 +366,28 @@ describe('git-kind reports: refresh before reading (#557)', () => {
 
     expect(await publish(machineB, 'members/alice.yaml', 'username: alice\n')).toBe(true);
     expect(await originReportsFile(origin, 'members/alice.yaml')).toBe('username: alice\n');
+  });
+});
+
+describe('git-kind reports: writers merge onto origin (#561)', () => {
+  it('merges a stale checkout of the same member onto origin instead of diverging', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const machineA = gitConfig(clone, origin);
+    const machineB = await cloneCheckout(origin, 'machine-b');
+
+    expect(await publish(machineA, 'stats/alice.yaml', 'n: 1\n')).toBe(true);
+    await ensureReportsWorktree(machineB);
+    expect(await publish(machineA, 'stats/alice.yaml', 'n: 2\n')).toBe(true);
+
+    // Machine B last saw n: 1. Its read-merge-write must start from origin's n: 2.
+    const pushed = await updateReports(machineB, async (wt) => {
+      const statsPath = path.join(wt, 'stats', 'alice.yaml');
+      const current = Number(/n: (\d+)/.exec(fs.readFileSync(statsPath, 'utf-8'))![1]);
+      fs.writeFileSync(statsPath, `n: ${current + 10}\n`);
+      return { files: ['stats/alice.yaml'], message: '[teamai] Update usage stats for alice' };
+    });
+
+    expect(pushed).toBe(true);
+    expect(await originReportsFile(origin, 'stats/alice.yaml')).toBe('n: 12\n');
   });
 });
