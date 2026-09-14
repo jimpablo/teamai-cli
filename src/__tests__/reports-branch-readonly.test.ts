@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   repoGit: {
     listRemote: vi.fn(),
     raw: vi.fn(),
+    branchLocal: vi.fn(),
   },
   worktreeGit: {
     raw: vi.fn(),
@@ -14,6 +15,7 @@ const mocks = vi.hoisted(() => ({
     push: vi.fn(),
     status: vi.fn(),
     revparse: vi.fn(),
+    fetch: vi.fn(),
   },
   isGitRepo: vi.fn(),
 }));
@@ -49,7 +51,7 @@ vi.mock('../update.js', () => ({
 }));
 
 import { acquireLock, releaseLock } from '../update.js';
-import { commitAndPushReports, ensureReportsWorktree } from '../utils/reports-branch.js';
+import { commitAndPushReports, ensureReportsWorktree, refreshReportsWorktree } from '../utils/reports-branch.js';
 
 const config: LocalConfig = {
   repo: {
@@ -64,12 +66,15 @@ const config: LocalConfig = {
   additionalRoles: [],
 };
 
+const WT = '/workspace/project/.teamai/reports-wt';
+
 describe('ensureReportsWorktree read-only cold start', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.isGitRepo.mockResolvedValue(false);
     mocks.repoGit.listRemote.mockResolvedValue('');
     mocks.repoGit.raw.mockResolvedValue('');
+    mocks.repoGit.branchLocal.mockResolvedValue({ all: ['main'] });
     mocks.worktreeGit.raw.mockResolvedValue('');
     mocks.worktreeGit.add.mockResolvedValue(undefined);
     mocks.worktreeGit.commit.mockResolvedValue(undefined);
@@ -79,7 +84,7 @@ describe('ensureReportsWorktree read-only cold start', () => {
   it('does not publish a new reports branch when pushIfCreated is false', async () => {
     await expect(
       ensureReportsWorktree(config, { pushIfCreated: false }),
-    ).resolves.toBe('/workspace/project/.teamai/reports-wt');
+    ).resolves.toBe(WT);
 
     expect(mocks.worktreeGit.push).not.toHaveBeenCalled();
   });
@@ -101,6 +106,28 @@ describe('ensureReportsWorktree read-only cold start', () => {
       '[teamai] Initialize reports branch',
       { '--no-verify': null },
     );
+  });
+
+  it('reuses an unpublished local reports branch instead of recreating the orphan branch', async () => {
+    mocks.repoGit.branchLocal.mockResolvedValue({ all: ['main', 'teamai-reports'] });
+
+    await expect(
+      ensureReportsWorktree(config, { pushIfCreated: false }),
+    ).resolves.toBe(WT);
+
+    expect(mocks.repoGit.raw).toHaveBeenCalledWith(['worktree', 'add', WT, 'teamai-reports']);
+    const orphanAdds = mocks.repoGit.raw.mock.calls.filter(([args]) => (args as string[]).includes('--orphan'));
+    expect(orphanAdds).toEqual([]);
+    expect(mocks.worktreeGit.commit).not.toHaveBeenCalled();
+    expect(mocks.worktreeGit.push).not.toHaveBeenCalled();
+  });
+
+  it('lets a writer publish a reused local reports branch', async () => {
+    mocks.repoGit.branchLocal.mockResolvedValue({ all: ['main', 'teamai-reports'] });
+
+    await ensureReportsWorktree(config);
+
+    expect(mocks.worktreeGit.push).toHaveBeenCalledWith(['-u', 'origin', 'teamai-reports']);
   });
 });
 
@@ -125,5 +152,34 @@ describe('commitAndPushReports', () => {
       '[teamai] Register member: alice',
       { '--no-verify': null },
     );
+  });
+});
+
+describe('refreshReportsWorktree', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.isGitRepo.mockResolvedValue(true);
+    mocks.worktreeGit.revparse.mockResolvedValue('true');
+    mocks.worktreeGit.fetch.mockResolvedValue(undefined);
+  });
+
+  it('reads the local copy without syncing while a report write holds the lock', async () => {
+    vi.mocked(acquireLock).mockResolvedValue(false);
+
+    await refreshReportsWorktree(config, { pushIfCreated: false });
+
+    expect(mocks.worktreeGit.fetch).not.toHaveBeenCalled();
+    expect(mocks.worktreeGit.raw).not.toHaveBeenCalled();
+    expect(releaseLock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the local copy when fetch fails (offline)', async () => {
+    vi.mocked(acquireLock).mockResolvedValue(true);
+    mocks.worktreeGit.fetch.mockRejectedValue(new Error('offline'));
+
+    await refreshReportsWorktree(config, { pushIfCreated: false });
+
+    expect(mocks.worktreeGit.raw).not.toHaveBeenCalled();
+    expect(releaseLock).toHaveBeenCalledOnce();
   });
 });

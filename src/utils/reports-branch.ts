@@ -95,15 +95,17 @@ async function remoteBranchExists(repoRoot: string): Promise<boolean> {
  * Idempotent. Returns the worktree absolute path.
  *
  * Cold-start cases handled:
- *  - worktree already present  → return it (optionally refreshed by caller).
+ *  - worktree already present  → return it (readers refresh it via refreshReportsWorktree).
  *  - remote branch exists      → worktree add --track -b from origin/teamai-reports.
- *  - remote branch absent      → create the orphan branch locally, then first-push.
+ *  - remote branch absent      → reuse an unpublished local branch, or create the
+ *                                orphan branch locally; then first-push unless
+ *                                `pushIfCreated` is false.
  */
 export interface EnsureReportsWorktreeOptions {
   /**
    * Whether a cold start may publish a newly created reports branch. Writers
-   * keep the default; read-only callers can materialize a local view without
-   * changing origin.
+   * keep the default; read-only callers must pass false so they materialize a
+   * local view without changing origin.
    */
   pushIfCreated?: boolean;
 }
@@ -169,15 +171,22 @@ export async function ensureReportsWorktree(
       await git.raw(['worktree', 'add', wt, '--track', '-b', REPORTS_BRANCH, `origin/${REPORTS_BRANCH}`]);
     }
   } else {
-    // Remote branch absent: create the orphan branch in the worktree.
-    await createOrphanWorktree(repoRoot, wt);
-    await writeWorktreeGitignore(wt);
-    const wtGit = createGit(wt);
-    await wtGit.add(['.gitignore']);
-    await commitSkippingHooks(wtGit, '[teamai] Initialize reports branch');
+    // Remote branch absent. A read-only cold start (or a failed first push)
+    // leaves an unpublished local branch; reuse it, because creating the orphan
+    // branch again fails with "a branch named 'teamai-reports' already exists".
+    const branches = await git.branchLocal();
+    if (branches.all.includes(REPORTS_BRANCH)) {
+      await git.raw(['worktree', 'add', wt, REPORTS_BRANCH]);
+    } else {
+      await createOrphanWorktree(repoRoot, wt);
+      await writeWorktreeGitignore(wt);
+      const wtGit = createGit(wt);
+      await wtGit.add(['.gitignore']);
+      await commitSkippingHooks(wtGit, '[teamai] Initialize reports branch');
+    }
     if (options.pushIfCreated !== false) {
       try {
-        await wtGit.push(['-u', 'origin', REPORTS_BRANCH]);
+        await createGit(wt).push(['-u', 'origin', REPORTS_BRANCH]);
       } catch (e) {
         log.debug(`[reports] initial push skipped: ${(e as Error).message}`);
       }
@@ -315,21 +324,86 @@ export async function commitAndPushReports(
 }
 
 /**
- * Best-effort refresh of the reports worktree from origin so reader commands
- * (digest/members/stats) see other members' latest data. Safe: only touches the
- * orphan-branch worktree, never the active tree.
+ * Bring the reports worktree up to date with origin. The caller holds the
+ * reports lock, so no commitAndPushReports runs at the same time.
+ *
+ *  - fetch fails (offline, or origin has no reports branch yet) → keep the local copy.
+ *  - no unpushed commits → fast-forward to origin.
+ *  - unpushed commits (e.g. a push that failed offline) → rebase them onto origin
+ *    so the next push delivers them.
+ *  - uncommitted report files (a writer wrote them but has not committed yet)
+ *    are carried along, never discarded; if they block the update, keep the
+ *    local copy.
+ *  - unpushed commits that conflict with origin (the same member reported from
+ *    another checkout) → dropped, so the worktree is not left diverged forever.
+ */
+async function syncReportsWorktree(wt: string): Promise<void> {
+  const git = createGit(wt);
+  const upstream = `origin/${REPORTS_BRANCH}`;
+  try {
+    await git.fetch(['origin', REPORTS_BRANCH]);
+  } catch (e) {
+    log.debug(`[reports] fetch failed, using the local copy: ${(e as Error).message}`);
+    return;
+  }
+
+  const dirty = !(await git.status()).isClean();
+  const ahead = Number.parseInt((await git.raw(['rev-list', '--count', `${upstream}..HEAD`])).trim(), 10);
+  try {
+    if (ahead > 0) {
+      await git.rebase(['--autostash', upstream]);
+    } else {
+      await git.raw(['merge', '--ff-only', upstream]);
+    }
+    return;
+  } catch (e) {
+    if (ahead > 0) {
+      try {
+        await git.rebase(['--abort']);
+      } catch {
+        // no rebase in progress
+      }
+    }
+    if (dirty) {
+      log.debug(`[reports] uncommitted report files block the refresh; using the local copy: ${(e as Error).message}`);
+      return;
+    }
+    log.debug(`[reports] dropping ${ahead} unpushed report commit(s) that conflict with ${upstream}: ${(e as Error).message}`);
+  }
+  await git.raw(['reset', '--hard', upstream]);
+}
+
+/**
+ * Best-effort refresh of the reports worktree from origin so readers (pull's
+ * search index and recommendations, members, digest, maintenance) see other
+ * members' latest data. Read-only callers pass `pushIfCreated: false`. When a
+ * report write holds the lock, the local copy is used as-is. Never throws.
+ * Safe: only touches the orphan-branch worktree, never the active tree.
  */
 export async function refreshReportsWorktree(
   localConfig: LocalConfig,
   options: EnsureReportsWorktreeOptions = {},
 ): Promise<void> {
+  if (!usesReportsBranch(localConfig)) {
+    return;
+  }
+
+  const lockPath = reportsLockPath(localConfig);
+  let locked = false;
   try {
+    locked = await acquireLock(lockPath);
     const wt = await ensureReportsWorktree(localConfig, options);
-    const git = createGit(wt);
-    await git.fetch(['origin', REPORTS_BRANCH]);
-    await git.raw(['reset', '--hard', `origin/${REPORTS_BRANCH}`]);
+    if (!locked) {
+      log.debug('[reports] a reports write is in progress; reading the local copy');
+      return;
+    }
+    await syncReportsWorktree(wt);
   } catch (e) {
     log.debug(`[reports] refresh skipped: ${(e as Error).message}`);
+  } finally {
+    if (locked) {
+      await releaseLock(lockPath);
+    }
   }
 }
 
